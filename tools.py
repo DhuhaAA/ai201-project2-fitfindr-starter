@@ -13,13 +13,45 @@ Tools:
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
 
 from utils.data_loader import load_listings
 
-load_dotenv()
+# Load env vars. Standard location is the project-root .env; we also check
+# .venv/.env because that's the file the editor tends to open, and it's easy to
+# paste the key into the wrong one. load_dotenv() defaults to override=False, so
+# the first file to define a var wins — root is loaded first and takes precedence.
+load_dotenv()  # project-root .env
+load_dotenv(os.path.join(os.path.dirname(__file__), ".venv", ".env"))  # fallback
+
+LLM_MODEL = "llama-3.3-70b-versatile"
+
+
+def _chat(messages: list[dict], temperature: float = 0.7, max_tokens: int = 400) -> str:
+    """Send a chat completion to Groq and return the response text."""
+    client = _get_groq_client()
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def _format_item(item: dict) -> str:
+    """Render a listing dict into a compact human/LLM-readable line."""
+    brand = item.get("brand") or "no brand"
+    return (
+        f"{item['title']} ({brand}, {item['condition']} condition) — "
+        f"${item['price']:.0f} on {item['platform']}. "
+        f"Category: {item['category']}. "
+        f"Colors: {', '.join(item['colors'])}. "
+        f"Style: {', '.join(item['style_tags'])}."
+    )
 
 
 # ── Groq client ───────────────────────────────────────────────────────────────
@@ -69,8 +101,40 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+
+    # Tokenize the query into lowercase keywords (drop very short noise words).
+    keywords = [w for w in re.findall(r"[a-z0-9']+", description.lower()) if len(w) > 1]
+
+    scored: list[tuple[int, dict]] = []
+    for item in listings:
+        # 1. Price filter (inclusive).
+        if max_price is not None and item["price"] > max_price:
+            continue
+
+        # 2. Size filter — case-insensitive substring match so "M" matches "S/M".
+        if size is not None and size.strip():
+            if size.strip().lower() not in item["size"].lower():
+                continue
+
+        # 3. Relevance score: count keyword hits across title, description, tags.
+        haystack = " ".join(
+            [
+                item["title"],
+                item["description"],
+                " ".join(item["style_tags"]),
+                item["category"],
+            ]
+        ).lower()
+        score = sum(1 for kw in keywords if kw in haystack)
+
+        # 4. Drop anything with no keyword overlap.
+        if score > 0:
+            scored.append((score, item))
+
+    # 5. Sort by score, highest first (stable — preserves dataset order on ties).
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in scored]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +164,50 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    item_desc = _format_item(new_item)
+    items = wardrobe.get("items", []) if wardrobe else []
+
+    if not items:
+        # Empty-wardrobe branch: general styling advice, no invented pieces.
+        prompt = (
+            f"A shopper is considering this secondhand piece:\n  {item_desc}\n\n"
+            "They have NOT entered any wardrobe items yet. Give general styling "
+            "advice for this piece: what categories and colors of clothing it pairs "
+            "well with, what vibe/occasions it suits, and one concrete outfit idea "
+            "built from common staples. Keep it to 3-4 sentences, friendly and "
+            "specific. End with a short nudge to add their wardrobe for personalized looks."
+        )
+    else:
+        wardrobe_lines = "\n".join(
+            f"  - {it['name']} ({it['category']}; {', '.join(it.get('colors', []))})"
+            + (f" — {it['notes']}" if it.get("notes") else "")
+            for it in items
+        )
+        prompt = (
+            f"A shopper is considering this secondhand piece:\n  {item_desc}\n\n"
+            f"Here is their actual wardrobe:\n{wardrobe_lines}\n\n"
+            "Suggest 1-2 complete outfits that style the new piece using SPECIFIC items "
+            "named from their wardrobe above. Reference pieces by name. Add one quick "
+            "styling tip (tuck, roll, layer). Keep it to 3-5 sentences, friendly and concrete."
+        )
+
+    try:
+        return _chat(
+            [
+                {
+                    "role": "system",
+                    "content": "You are FitFindr, a warm, knowledgeable secondhand-fashion stylist.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,
+        )
+    except Exception as exc:  # network/auth/etc — degrade gracefully
+        return (
+            f"(Couldn't reach the styling model: {exc}) "
+            f"As a fallback: {new_item['title']} works well with neutral basics and "
+            "denim — build around its main colors and keep the rest simple."
+        )
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +239,35 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    # 1. Guard against an empty / whitespace-only outfit.
+    if not outfit or not outfit.strip():
+        return (
+            "⚠️ Can't write a fit card without an outfit suggestion — "
+            "the styling step returned nothing."
+        )
+
+    item_desc = _format_item(new_item)
+    prompt = (
+        f"Write a short, casual social-media caption (Instagram/TikTok OOTD style) "
+        f"for a secondhand find.\n\n"
+        f"The piece:\n  {item_desc}\n\n"
+        f"How it's being styled:\n  {outfit}\n\n"
+        "Rules: 2-4 sentences. Sound like a real person posting their fit, NOT a "
+        "product description. Mention the item name, its price, and the platform "
+        "naturally — once each. Capture the outfit vibe in specific terms. Emojis ok "
+        "but don't overdo it. No hashtag wall."
+    )
+
+    try:
+        return _chat(
+            [
+                {
+                    "role": "system",
+                    "content": "You write authentic, casual fashion captions for real social posts.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.9,  # higher temp → captions vary between runs
+        )
+    except Exception as exc:
+        return f"(Couldn't reach the caption model: {exc})"
